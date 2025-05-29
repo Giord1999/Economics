@@ -11,7 +11,7 @@ from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM
 import os
 import warnings
 
-#TODO: inserire la preferenza temporale e la struttura del capitale
+# TODO: inserire la struttura del capitale se necessario
 
 # Suppress specific warnings
 warnings.filterwarnings("ignore", category=FutureWarning, module="transformers.tokenization_utils_base")
@@ -48,9 +48,10 @@ buyers_utility = np.random.uniform(100, 200, num_buyers)
 sellers_cost = np.random.uniform(50, 150, num_sellers)
 
 # Q-learning parameters
-state_size = 3         # [utility (or cost), reservation_price, bid/ask price]
+# State size is now 4: [utility (or cost), reservation_price, bid/ask price, beta]
+state_size = 4
 action_size = 3        # Actions: 0 = Increase, 1 = Decrease, 2 = Maintain
-gamma = 0.9            # Discount factor
+
 learning_rate = 0.001  # Learning rate for optimizers
 
 # Exploration (epsilon-greedy)
@@ -96,24 +97,32 @@ class QNetwork(nn.Module):
 class Buyer:
     def __init__(self, utility: float, index: int):
         self.utility = utility
-        # Reservation price drawn around 5 euros
+        # Reservation price drawn around 3-7.5 euros
         self.reservation_price = random.uniform(3.0, 7.5)
         # Initial bid price
         self.bid_price = max(self.reservation_price, utility * random.uniform(0.6, 1.0))
         # Index to identify cluster membership
         self.index = index
+        # Time preference: beta_i in (0.85, 0.99)
+        self.beta = random.uniform(0.85, 0.99)
 
     def get_state(self) -> torch.Tensor:
-        """Return normalized state tensor [utility, reservation_price, bid_price]."""
+        """
+        Return normalized state tensor:
+        [utility, reservation_price, bid_price, beta].
+        """
         raw_state = torch.tensor([
             self.utility,
             self.reservation_price,
-            self.bid_price
+            self.bid_price,
+            self.beta
         ], dtype=torch.float32)
         return normalize_state(raw_state)
 
     def update_bid_rl(self, action: int):
-        """Update bid_price according to Q-learning action."""
+        """
+        Update bid_price according to Q-learning action.
+        """
         if action == 0:  # Increase price
             self.bid_price *= random.uniform(1.05, 1.1)
         elif action == 1:  # Decrease price
@@ -123,30 +132,40 @@ class Buyer:
         self.bid_price = min(self.bid_price, self.reservation_price * 2)
 
     def imitate_peer(self, peer_bid: float):
-        """With some probability, adopt a peer's bid price."""
+        """
+        With some probability, adopt a peer's bid price.
+        """
         self.bid_price = peer_bid
 
 class Seller:
     def __init__(self, cost: float, index: int):
         self.cost = cost
-        # Reservation price drawn around 5 euros
+        # Reservation price drawn around 3-7.5 euros
         self.reservation_price = random.uniform(3.0, 7.5)
         # Initial ask price
         self.ask_price = max(self.reservation_price, cost * random.uniform(1.1, 1.5))
         # Index to identify cluster membership
         self.index = index
+        # Time preference: beta_i in (0.85, 0.99)
+        self.beta = random.uniform(0.85, 0.99)
 
     def get_state(self) -> torch.Tensor:
-        """Return normalized state tensor [cost, reservation_price, ask_price]."""
+        """
+        Return normalized state tensor:
+        [cost, reservation_price, ask_price, beta].
+        """
         raw_state = torch.tensor([
             self.cost,
             self.reservation_price,
-            self.ask_price
+            self.ask_price,
+            self.beta
         ], dtype=torch.float32)
         return normalize_state(raw_state)
 
     def update_price_rl(self, action: int):
-        """Update ask_price according to Q-learning action."""
+        """
+        Update ask_price according to Q-learning action.
+        """
         if action == 0:  # Increase price
             self.ask_price *= random.uniform(1.05, 1.1)
         elif action == 1:  # Decrease price
@@ -156,13 +175,14 @@ class Seller:
         self.ask_price = min(self.ask_price, self.reservation_price * 2)
 
     def imitate_peer(self, peer_ask: float):
-        """With some probability, adopt a peer's ask price."""
+        """
+        With some probability, adopt a peer's ask price.
+        """
         self.ask_price = peer_ask
 
 # -----------------------------
 # LLM-based advice system
 # -----------------------------
-# We cluster agents into two subgroups (0 .. num//2-1, num//2 .. num-1) to simulate local training.
 def get_cluster_index(agent_index: int, total_agents: int) -> int:
     """
     Determine cluster index (0 or 1) based on agent index.
@@ -183,7 +203,7 @@ def llm_advice(role: str, feedback: str, reservation_price: float, cluster: int,
     global advice_cache
 
     cache_key = (role, cluster, feedback)
-    # Refresh advice every 'advice_frequency' rounds or if not presente
+    # Refresh advice every 'advice_frequency' rounds or if not present
     if (round_num % advice_frequency == 0) or (cache_key not in advice_cache):
         prompt = (
             f"In cluster {cluster}, a {role} had a '{feedback}' transaction. "
@@ -212,7 +232,6 @@ def llm_advice(role: str, feedback: str, reservation_price: float, cluster: int,
         return random.uniform(0.85, 0.95)
     else:
         return random.uniform(0.95, 1.05)
-
 
 # -----------------------------
 # Initialize agents
@@ -293,26 +312,30 @@ for round_num in range(num_rounds):
             action_buyer = random.choice(range(action_size))
             action_seller = random.choice(range(action_size))
 
-        # Apply LLM advice: adjust an internal "factor" before Q-update
-        # For simplicity, we treat advice as a multiplicative factor on the bid/ask after RL update.
-        # First, perform RL-based price update
+        # Perform RL-based price update
         buyer.update_bid_rl(action_buyer)
         seller.update_price_rl(action_seller)
 
         # Determine if a transaction occurs
         if buyer.bid_price >= seller.ask_price:
+            raw_profit = max(0.0, buyer.utility - seller.cost)
+            raw_utility = max(0.0, buyer.utility - buyer.bid_price)
+
+            # Apply each agent's time preference (beta) to the raw payoff
+            profit_buyer = raw_utility * buyer.beta
+            profit_seller = raw_profit * seller.beta
+
+            transactions_advice += 1
+            round_profit_advice += profit_seller
+            round_utility_advice += profit_buyer
+
             feedback_buyer = "success"
             feedback_seller = "success"
-            transactions_advice += 1
-            profit = max(0.0, buyer.utility - seller.cost)
-            utility = max(0.0, buyer.utility - buyer.bid_price)
-            round_profit_advice += profit
-            round_utility_advice += utility
         else:
+            profit_buyer = -1.0 * buyer.beta
+            profit_seller = -1.0 * seller.beta
             feedback_buyer = "failure"
             feedback_seller = "failure"
-            profit = -1.0
-            utility = -1.0
 
         # Retrieve LLM advice factors
         factor_buyer = llm_advice("buyer", feedback_buyer, buyer.reservation_price, cluster_buyer, round_num)
@@ -330,9 +353,9 @@ for round_num in range(num_rounds):
 
         # Log the advice
         advice_log.append(
-            f"Round {round_num}: Buyer {buyer.index} ({'success' if feedback_buyer=='success' else 'fail'}) "
+            f"Round {round_num}: Buyer {buyer.index} ({feedback_buyer}) "
             f"advice factor {factor_buyer:.3f}; "
-            f"Seller {seller.index} ({'success' if feedback_seller=='success' else 'fail'}) "
+            f"Seller {seller.index} ({feedback_seller}) "
             f"advice factor {factor_seller:.3f}"
         )
 
@@ -340,13 +363,13 @@ for round_num in range(num_rounds):
         bid_prices_round_advice.append(buyer.bid_price)
         ask_prices_round_advice.append(seller.ask_price)
 
-        # Q-learning update every 10 rounds
+        # Q-learning update every 10 rounds, using each agent's beta as discount factor
         if round_num % 10 == 0:
             next_state_buyer = buyer.get_state()
             next_state_seller = seller.get_state()
             with torch.no_grad():
-                target_buyer = profit + gamma * q_network_advice(next_state_buyer).max().item()
-                target_seller = profit + gamma * q_network_advice(next_state_seller).max().item()
+                target_buyer = profit_buyer + buyer.beta * q_network_advice(next_state_buyer).max().item()
+                target_seller = profit_seller + seller.beta * q_network_advice(next_state_seller).max().item()
 
             pred_buyer = q_network_advice(state_buyer)[action_buyer]
             pred_seller = q_network_advice(state_seller)[action_seller]
@@ -361,7 +384,6 @@ for round_num in range(num_rounds):
     for group_agents, is_buyer_group in [(buyers_advice, True), (sellers_advice, False)]:
         for agent in group_agents:
             if random.random() < imitation_probability:
-                # Choose a random peer from the same group (excluding self)
                 peer = random.choice([a for a in group_agents if a.index != agent.index])
                 if is_buyer_group:
                     agent.imitate_peer(peer.bid_price)
@@ -401,16 +423,21 @@ for round_num in range(num_rounds):
 
         # Determine if a transaction occurs
         if buyer.bid_price >= seller.ask_price:
+            raw_profit = max(0.0, buyer.utility - seller.cost)
+            raw_utility = max(0.0, buyer.utility - buyer.bid_price)
+
+            profit_buyer = raw_utility * buyer.beta
+            profit_seller = raw_profit * seller.beta
+
             transactions_no_advice += 1
-            profit = max(0.0, buyer.utility - seller.cost)
-            utility = max(0.0, buyer.utility - buyer.bid_price)
-            round_profit_no_advice += profit
-            round_utility_no_advice += utility
+            round_profit_no_advice += profit_seller
+            round_utility_no_advice += profit_buyer
+
             feedback_buyer = "success"
             feedback_seller = "success"
         else:
-            profit = -1.0
-            utility = -1.0
+            profit_buyer = -1.0 * buyer.beta
+            profit_seller = -1.0 * seller.beta
             feedback_buyer = "failure"
             feedback_seller = "failure"
 
@@ -418,13 +445,13 @@ for round_num in range(num_rounds):
         bid_prices_round_no_advice.append(buyer.bid_price)
         ask_prices_round_no_advice.append(seller.ask_price)
 
-        # Q-learning update every 10 rounds
+        # Q-learning update every 10 rounds, using each agent's beta
         if round_num % 10 == 0:
             next_state_buyer = buyer.get_state()
             next_state_seller = seller.get_state()
             with torch.no_grad():
-                target_buyer = profit + gamma * q_network_no_advice(next_state_buyer).max().item()
-                target_seller = profit + gamma * q_network_no_advice(next_state_seller).max().item()
+                target_buyer = profit_buyer + buyer.beta * q_network_no_advice(next_state_buyer).max().item()
+                target_seller = profit_seller + seller.beta * q_network_no_advice(next_state_seller).max().item()
 
             pred_buyer = q_network_no_advice(state_buyer)[action_buyer]
             pred_seller = q_network_no_advice(state_seller)[action_seller]
@@ -462,10 +489,9 @@ for round_num in range(num_rounds):
     epsilon = max(min_epsilon, epsilon * epsilon_decay)
     epsilon_values.append(epsilon)
 
-    # Optional: print progress
+    # Optional: print progress every 100 rounds
     if (round_num + 1) % 100 == 0 or (round_num == num_rounds - 1):
-        print(f"Round {round_num + 1:3d} (With LLM): Transactions = {transactions_advice:2d}, "
-              f"(No LLM): Transactions = {transactions_no_advice:2d}")
+        print(f"Round {round_num + 1:3d} (With LLM): Tx = {transactions_advice:2d}, (No LLM): Tx = {transactions_no_advice:2d}")
 
 print("Simulazione completata!")
 
