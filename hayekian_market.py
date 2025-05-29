@@ -11,6 +11,8 @@ from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM
 import os
 import warnings
 
+#TODO: inserire la preferenza temporale e la struttura del capitale
+
 # Suppress specific warnings
 warnings.filterwarnings("ignore", category=FutureWarning, module="transformers.tokenization_utils_base")
 
