@@ -308,27 +308,38 @@ class HeterogeneousAgentModel:
                 self.shock_recognition[t] = max(0.0, self.shock_recognition[t-1] - 0.05)
     
     def central_bank_reaction(self, t):
-        """Reazione della banca centrale"""
+        """Reazione della banca centrale - solo targeting della spesa nominale"""
         if t == 0:
-            self.r_market[t] = self.r_natural[t]
+            # Inizializzazione: spesa nominale al target più shock monetario
             self.n[t] = self.n_star[t] + self.eps_monetary[t]
+            # Tasso di mercato segue passivamente il tasso naturale
+            self.r_market[t] = self.r_natural[t]
         else:
-            # Smoothing del tasso di mercato
-            r_gap = self.r_natural[t] - self.r_market[t-1]
-            self.r_market[t] = self.r_market[t-1] + 0.6 * r_gap
+            # REGOLA DI POLITICA MONETARIA - Solo spesa nominale
             
-            # Regola di politica monetaria con attenzione alle condizioni finanziarie
-            rate_gap = self.r_natural[t] - self.r_market[t]
+            # 1. Gap di spesa nominale
+            n_gap = self.n_expected[t] - self.n_star[t]
+            
+            # 2. Preoccupazioni per stabilità finanziaria
             financial_stability_concern = abs(self.credit_conditions[t]) * 0.3
             
-            n_adjustment = (self.phi * rate_gap - 
-                          financial_stability_concern + 
-                          self.eps_monetary[t])
+            # 3. Aggiustamento della spesa nominale
+            n_adjustment = (-self.phi * n_gap -  # contrasta deviazioni dal target
+                        financial_stability_concern +  # riduce spesa se tensioni creditizie
+                        self.eps_monetary[t])  # shock di politica monetaria
             
+            # 4. Learning e commitment sulla spesa nominale
             commitment_strength = 0.8 + 0.2 * self.shock_recognition[t]
+            
+            # 5. Regola finale per spesa nominale
             self.n[t] = (commitment_strength * self.n_star[t] + 
                         (1 - commitment_strength) * (self.n_star[t] + n_adjustment))
-    
+            
+            # 6. Tasso di mercato segue passivamente (nessun targeting attivo)
+            # La BC non controlla direttamente i tassi, che si adeguano al mercato
+            r_gap = self.r_natural[t] - self.r_market[t-1]
+            self.r_market[t] = self.r_market[t-1] + 0.6 * r_gap  # convergenza più lenta    
+
     def solve_equilibrium(self, t):
         """Risolve equilibrio del periodo"""
         n_gap = self.n[t] - self.n_expected[t]
